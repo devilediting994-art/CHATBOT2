@@ -40,10 +40,10 @@ GAME_BAN_FILE = "connect_game_banned.json"
 CONNECT_LB_FILE = "connect_leaderboard.json"
 ECONOMY_FILE = "economy.json"
 
-START_PHOTO = "https://files.catbox.moe/xjge2y.jpg"
+START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
-FORCE_CHANNEL = "@Leo000079"
-SUPPORT_LINK = "https://t.me/Leo000079"
+FORCE_CHANNEL = "@JP_NETWORK"
+SUPPORT_LINK = "https://t.me/jp_network"
 
 JOIN_TIME = 30
 MAX_LEVELS = 10
