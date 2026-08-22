@@ -50,6 +50,7 @@ CLONES_FILE = "clones.json"
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chatbot2")
 MONGO_CLONES_COLLECTION = os.getenv("MONGO_CLONES_COLLECTION", "cloned_bots")
+MONGO_BOT_USERS_COLLECTION = os.getenv("MONGO_BOT_USERS_COLLECTION", "bot_users")
 
 START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
@@ -151,16 +152,20 @@ clone_registry = load_data(CLONES_FILE, {})
 # MongoDB is used for persistent dynamic clones so Railway restarts do not lose them.
 mongo_client = None
 mongo_clones = None
+mongo_bot_users = None
 if MONGO_URI:
     try:
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         mongo_client.admin.command("ping")
-        mongo_clones = mongo_client[MONGO_DB_NAME][MONGO_CLONES_COLLECTION]
-        print("MongoDB connected for dynamic clones")
+        db = mongo_client[MONGO_DB_NAME]
+        mongo_clones = db[MONGO_CLONES_COLLECTION]
+        mongo_bot_users = db[MONGO_BOT_USERS_COLLECTION]
+        print("MongoDB connected for dynamic clones and bot users")
     except Exception as e:
         print("MongoDB connection failed; local clone storage will be used:", e)
         mongo_client = None
         mongo_clones = None
+        mongo_bot_users = None
 
 def load_clone_registry():
     global clone_registry
@@ -182,6 +187,26 @@ def load_clone_registry():
         except Exception as e:
             print("Mongo clone load error:", e)
     clone_registry = load_data(CLONES_FILE, {})
+
+def load_bot_users_registry():
+    """Load persistent per-bot user audiences from MongoDB."""
+    global bot_users
+    if mongo_bot_users is not None:
+        try:
+            loaded = {}
+            for doc in mongo_bot_users.find({}, {"_id": 0, "bot_id": 1, "user_ids": 1}):
+                bot_id = str(doc.get("bot_id", ""))
+                if bot_id:
+                    loaded[bot_id] = [int(x) for x in (doc.get("user_ids") or [])]
+            if loaded:
+                bot_users = loaded
+                save_data(BOT_USERS_FILE, bot_users)
+                print(f"Loaded bot user audiences for {len(bot_users)} bot(s)")
+                return
+        except Exception as e:
+            print("Mongo bot user load error:", e)
+    bot_users = load_data(BOT_USERS_FILE, {})
+
 
 def save_clone_record(token, owner_id, username, bot_id):
     # MongoDB can store datetime natively, but the local JSON fallback cannot.
@@ -239,6 +264,15 @@ def track_active(update: Update):
     if user.id not in bot_users[bot_key]:
         bot_users[bot_key].append(user.id)
         save_data(BOT_USERS_FILE, bot_users)
+        if mongo_bot_users is not None and bot_key != "unknown":
+            try:
+                mongo_bot_users.update_one(
+                    {"bot_id": bot_key},
+                    {"$addToSet": {"user_ids": int(user.id)}},
+                    upsert=True,
+                )
+            except Exception as e:
+                print("Mongo bot user save error:", e)
     if user.id not in users:
         users.append(user.id)
         save_data(USERS_FILE, users)
@@ -984,7 +1018,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Users: {len(users)}\n📢 Groups: {len(groups)}")
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a community announcement to users who have interacted with each bot."""
+    """Send one community announcement to users who have interacted with a connected bot."""
     if update.effective_user.id != OWNER_ID:
         return
 
@@ -997,22 +1031,30 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_items:
         bot_items = [(str(context.bot.id), context.application)]
 
-    sent = failed = 0
+    # Choose one connected bot for each recipient so users never receive
+    # the same announcement multiple times just because several bots know them.
+    recipient_routes = {}
     for bot_id, application in bot_items:
-        # Each bot only sends to users who have previously interacted with that bot.
         audience = list(dict.fromkeys(bot_users.get(str(bot_id), [])))
         for uid in audience:
-            try:
-                await application.bot.send_message(int(uid), msg)
-                sent += 1
-            except Exception:
-                failed += 1
+            recipient_routes.setdefault(int(uid), application)
+
+    sent = failed = 0
+    for uid, application in recipient_routes.items():
+        try:
+            await application.bot.send_message(uid, msg)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"Broadcast failed for {uid}: {type(e).__name__}: {e}")
 
     await update.message.reply_text(
-        f"📢 Broadcast sent\n"
-        f"🤖 Bots: {len(bot_items)}\n"
+        f"📢 <b>Broadcast sent</b>\n"
+        f"🤖 Connected bots: {len(bot_items)}\n"
+        f"👥 Recipients: {len(recipient_routes)}\n"
         f"✅ Delivered: {sent}\n"
-        f"❌ Failed: {failed}"
+        f"❌ Failed: {failed}",
+        parse_mode=ParseMode.HTML,
     )
 
 async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2110,6 +2152,7 @@ async def run_bot(token, label):
 
 async def run_all_bots():
     load_clone_registry()
+    load_bot_users_registry()
     tokens = [BOT_TOKEN]
 
     # Existing ENV clones are still supported for backward compatibility.
