@@ -47,10 +47,14 @@ GAME_BAN_FILE = "connect_game_banned.json"
 CONNECT_LB_FILE = "connect_leaderboard.json"
 ECONOMY_FILE = "economy.json"
 CLONES_FILE = "clones.json"
+WELCOMES_FILE = "welcomes.json"
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chatbot2")
 MONGO_CLONES_COLLECTION = os.getenv("MONGO_CLONES_COLLECTION", "cloned_bots")
 MONGO_BOT_USERS_COLLECTION = os.getenv("MONGO_BOT_USERS_COLLECTION", "bot_users")
+MONGO_WELCOMES_COLLECTION = os.getenv("MONGO_WELCOMES_COLLECTION", "group_welcomes")
+MONGO_LANG_COLLECTION = os.getenv("MONGO_LANG_COLLECTION", "user_languages")
+LANG_FILE = "languages.json"
 
 START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
@@ -149,10 +153,15 @@ connect_leaderboard = load_data(CONNECT_LB_FILE, {})
 economy_data = load_data(ECONOMY_FILE, {})
 clone_registry = load_data(CLONES_FILE, {})
 
+welcomes = load_data(WELCOMES_FILE, {})
+languages = load_data(LANG_FILE, {})
+
 # MongoDB is used for persistent dynamic clones so Railway restarts do not lose them.
 mongo_client = None
 mongo_clones = None
 mongo_bot_users = None
+mongo_welcomes = None
+mongo_languages = None
 if MONGO_URI:
     try:
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -160,12 +169,16 @@ if MONGO_URI:
         db = mongo_client[MONGO_DB_NAME]
         mongo_clones = db[MONGO_CLONES_COLLECTION]
         mongo_bot_users = db[MONGO_BOT_USERS_COLLECTION]
-        print("MongoDB connected for dynamic clones and bot users")
+        mongo_welcomes = db[MONGO_WELCOMES_COLLECTION]
+        mongo_languages = db[MONGO_LANG_COLLECTION]
+        print("MongoDB connected for dynamic clones, bot users, and group welcomes")
     except Exception as e:
         print("MongoDB connection failed; local clone storage will be used:", e)
         mongo_client = None
         mongo_clones = None
         mongo_bot_users = None
+        mongo_welcomes = None
+    mongo_languages = None
 
 def load_clone_registry():
     global clone_registry
@@ -293,6 +306,84 @@ def get_random_member(chat_id, exclude_id=None):
         members = [m for m in members if m["id"] != exclude_id]
     return random.choice(members) if members else None
 
+def welcome_key(update):
+    """Per-bot, per-group welcome setting key."""
+    try:
+        bot_id = str(update.get_bot().id)
+    except Exception:
+        bot_id = "unknown"
+    return f"{bot_id}:{update.effective_chat.id}"
+
+def save_welcome_setting(update, text):
+    key = welcome_key(update)
+    welcomes[key] = text
+    save_data(WELCOMES_FILE, welcomes)
+    if mongo_welcomes is not None and update.effective_chat:
+        try:
+            bot_id = int(update.get_bot().id)
+            mongo_welcomes.update_one(
+                {"bot_id": bot_id, "chat_id": int(update.effective_chat.id)},
+                {"$set": {"text": text}},
+                upsert=True,
+            )
+        except Exception as e:
+            print("Mongo welcome save error:", e)
+
+def delete_welcome_setting(update):
+    key = welcome_key(update)
+    welcomes.pop(key, None)
+    save_data(WELCOMES_FILE, welcomes)
+    if mongo_welcomes is not None and update.effective_chat:
+        try:
+            mongo_welcomes.delete_one({"bot_id": int(update.get_bot().id), "chat_id": int(update.effective_chat.id)})
+        except Exception as e:
+            print("Mongo welcome delete error:", e)
+
+def get_welcome_setting(update):
+    key = welcome_key(update)
+    if key in welcomes:
+        return welcomes[key]
+    if mongo_welcomes is not None and update.effective_chat:
+        try:
+            doc = mongo_welcomes.find_one(
+                {"bot_id": int(update.get_bot().id), "chat_id": int(update.effective_chat.id)},
+                {"_id": 0, "text": 1},
+            )
+            if doc and doc.get("text"):
+                welcomes[key] = doc["text"]
+                return doc["text"]
+        except Exception as e:
+            print("Mongo welcome read error:", e)
+    return None
+
+async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("❌ /setwelcome sirf group me use karo.")
+        return
+    if not await is_admin_or_owner(update, context):
+        await update.message.reply_text("❌ Sirf group admin /setwelcome use kar sakta hai.")
+        return
+    raw = update.message.text or ""
+    text = raw.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text(
+            "📝 Usage:\n/setwelcome <message>\n\n"
+            "Placeholders:\n{name} = member name\n{id} = member ID\n{username} = username\n{group} = group name\n{bot} = bot name\n{mention} = clickable mention"
+        )
+        return
+    save_welcome_setting(update, text)
+    await update.message.reply_text("✅ Welcome message save ho gaya.")
+
+async def delwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("❌ /delwelcome sirf group me use karo.")
+        return
+    if not await is_admin_or_owner(update, context):
+        await update.message.reply_text("❌ Sirf group admin /delwelcome use kar sakta hai.")
+        return
+    delete_welcome_setting(update)
+    await update.message.reply_text("✅ Custom welcome remove ho gaya. Default welcome restore ho gaya.")
+
 async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == OWNER_ID:
         return True
@@ -311,6 +402,147 @@ async def is_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         return False
 
+
+
+# =========================
+# LANGUAGE SYSTEM
+# =========================
+LANGUAGE_NAMES = {
+    # ⭐ Top 3 — shown first
+    "hinglish": "🇮🇳 Hinglish",
+    "english": "🇬🇧 English",
+    "hindi": "🇮🇳 Hindi",
+
+    # 🌍 Other supported languages
+    "bengali": "🇧🇩 Bengali",
+    "tamil": "🇮🇳 Tamil",
+    "telugu": "🇮🇳 Telugu",
+    "marathi": "🇮🇳 Marathi",
+    "gujarati": "🇮🇳 Gujarati",
+    "punjabi": "🇮🇳 Punjabi",
+    "kannada": "🇮🇳 Kannada",
+    "malayalam": "🇮🇳 Malayalam",
+    "urdu": "🇵🇰 Urdu",
+    "odia": "🇮🇳 Odia",
+    "assamese": "🇮🇳 Assamese",
+    "nepali": "🇳🇵 Nepali",
+    "spanish": "🇪🇸 Spanish",
+    "french": "🇫🇷 French",
+    "arabic": "🇸🇦 Arabic",
+    "russian": "🇷🇺 Russian",
+    "portuguese": "🇵🇹 Portuguese",
+}
+
+LANGUAGE_PROMPTS = {
+    "hinglish": "Reply in natural Hindi using English/Roman letters, with short casual replies.",
+    "english": "Reply in natural English.",
+    "hindi": "Reply in natural Hindi using Devanagari script.",
+    "bengali": "Reply in natural Bengali script.",
+    "tamil": "Reply in natural Tamil script.",
+    "telugu": "Reply in natural Telugu script.",
+    "marathi": "Reply in natural Marathi using Devanagari script.",
+    "gujarati": "Reply in natural Gujarati script.",
+    "punjabi": "Reply in natural Punjabi script.",
+    "kannada": "Reply in natural Kannada script.",
+    "malayalam": "Reply in natural Malayalam script.",
+    "urdu": "Reply in natural Urdu script.",
+    "odia": "Reply in natural Odia script.",
+    "assamese": "Reply in natural Assamese script.",
+    "nepali": "Reply in natural Nepali using Devanagari script.",
+    "spanish": "Reply in natural Spanish.",
+    "french": "Reply in natural French.",
+    "arabic": "Reply in natural Arabic script.",
+    "russian": "Reply in natural Russian using Cyrillic script.",
+    "portuguese": "Reply in natural Portuguese.",
+}
+
+def language_key(update):
+    try:
+        bot_id = str(update.get_bot().id)
+    except Exception:
+        bot_id = "unknown"
+    uid = str(update.effective_user.id) if update.effective_user else "unknown"
+    return f"{bot_id}:{uid}"
+
+def get_user_language(update):
+    key = language_key(update)
+    value = languages.get(key, "hinglish")
+    if mongo_languages is not None and update.effective_user:
+        try:
+            bot_id = int(update.get_bot().id)
+            doc = mongo_languages.find_one({"bot_id": bot_id, "user_id": int(update.effective_user.id)}, {"_id": 0, "language": 1})
+            if doc and doc.get("language") in LANGUAGE_NAMES:
+                value = doc["language"]
+                languages[key] = value
+        except Exception as e:
+            print("Mongo language read error:", e)
+    return value
+
+def save_user_language(update, language):
+    key = language_key(update)
+    languages[key] = language
+    save_data(LANG_FILE, languages)
+    if mongo_languages is not None and update.effective_user:
+        try:
+            mongo_languages.update_one(
+                {"bot_id": int(update.get_bot().id), "user_id": int(update.effective_user.id)},
+                {"$set": {"language": language}},
+                upsert=True,
+            )
+        except Exception as e:
+            print("Mongo language save error:", e)
+
+async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = get_user_language(update)
+    # Top 3 stay pinned at the top; remaining 17 languages follow below.
+    language_order = list(LANGUAGE_NAMES.keys())
+    keyboard = [
+        [InlineKeyboardButton(LANGUAGE_NAMES[key], callback_data=f"lang:{key}") for key in language_order[:3]],
+    ]
+    for i in range(3, len(language_order), 2):
+        row = [InlineKeyboardButton(LANGUAGE_NAMES[key], callback_data=f"lang:{key}") for key in language_order[i:i + 2]]
+        keyboard.append(row)
+    await update.message.reply_text(
+        f"🌐 <b>Choose your chat language</b>\n\nCurrent: <b>{html.escape(LANGUAGE_NAMES.get(current, current))}</b>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not query.data.startswith("lang:"):
+        return
+    language = query.data.split(":", 1)[1]
+    if language not in LANGUAGE_NAMES:
+        return
+    save_user_language(update, language)
+    await query.edit_message_text(
+        f"✅ Language changed to <b>{html.escape(LANGUAGE_NAMES[language])}</b>.\n\nFuture AI replies will use this language.",
+        parse_mode=ParseMode.HTML,
+    )
+
+# =========================
+# SAFE CONTENT CHECK
+# =========================
+UNSAFE_TERMS = {
+    "nsfw", "porn", "porno", "xxx", "nude", "nudity", "sex video", "adult video",
+    "explicit content", "sexual content"
+}
+
+async def nsfwcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip()
+    if not text and update.message.reply_to_message and update.message.reply_to_message.text:
+        text = update.message.reply_to_message.text
+    if not text:
+        await update.message.reply_text("Usage: /nsfwcheck <text>\nYa kisi text message ko reply karke /nsfwcheck karo.")
+        return
+    lowered = text.lower()
+    matched = [term for term in UNSAFE_TERMS if term in lowered]
+    if matched:
+        await update.message.reply_text("⚠️ Result: potentially unsafe/adult content detected.")
+    else:
+        await update.message.reply_text("✅ Result: no obvious unsafe/adult-content keywords detected.")
 
 # =========================
 # ECONOMY SYSTEM
@@ -819,6 +1051,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_active(update)
     me = await context.bot.get_me()
     bot_username = me.username or ""
+    bot_display_name = me.first_name or me.username or "Bot"
+    bot_display_name_html = html.escape(bot_display_name)
     add_group_url = f"https://t.me/{bot_username}?startgroup=true" if bot_username else SUPPORT_LINK
 
     keyboard = InlineKeyboardMarkup([
@@ -829,10 +1063,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ])
 
-    caption = """✨ <b>W E L C O M E</b> ✨
+    caption = f"""✨ <b>W E L C O M E</b> ✨
 
 ╭───────────────╮
-│  🤖 <b>ᴍᴇᴇᴛ ᴀᴅᴀ</b>  │
+│  🤖 <b>ᴍᴇᴇᴛ {bot_display_name_html}</b>  │
 ╰───────────────╯
 
 🌸 <b>Yᴏᴜʀ ꜰʀɪᴇɴᴅʟʏ ᴀɪ ᴄʜᴀᴛʙᴏᴛ</b>
@@ -1085,19 +1319,37 @@ async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    custom = get_welcome_setting(update)
+    try:
+        bot_info = await context.bot.get_me()
+        bot_name = bot_info.first_name or bot_info.username or "Bot"
+    except Exception:
+        bot_name = "Bot"
+
     for member in update.message.new_chat_members:
         mention = f'<a href="tg://user?id={member.id}">{html.escape(member.first_name or "User")}</a>'
         if member.id == context.bot.id:
-            await update.message.reply_text("💕 ᴛʜᴀɴᴋꜱ ꜰᴏʀ ᴀᴅᴅɪɴɢ ᴍᴇ!\n\nᴜꜱᴇ /help ᴛᴏ ᴇxᴘʟᴏʀᴇ ᴍʏ ꜰᴇᴀᴛᴜʀᴇꜱ ✨")
+            await update.message.reply_text(
+                f"💕 ᴛʜᴀɴᴋꜱ ꜰᴏʀ ᴀᴅᴅɪɴɢ {html.escape(bot_name)}!\n\n"
+                "✨ ᴜꜱᴇ /start ᴛᴏ ᴇxᴘʟᴏʀᴇ ᴍʏ ꜰᴇᴀᴛᴜʀᴇꜱ",
+                parse_mode=ParseMode.HTML
+            )
+            continue
+
+        if custom:
+            username = f"@{member.username}" if member.username else ""
+            text = custom.replace("{name}", html.escape(member.first_name or "User"))
+            text = text.replace("{id}", str(member.id))
+            text = text.replace("{username}", html.escape(username))
+            text = text.replace("{group}", html.escape(update.effective_chat.title or "Group"))
+            text = text.replace("{bot}", html.escape(bot_name))
+            text = text.replace("{mention}", mention)
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
         else:
             await update.message.reply_text(
-                f"""🎉 Wᴇʟᴄᴏᴍᴇ Tᴏ Tʜᴇ Gʀᴏᴜᴘ 🎉
-
-{mention}
-
-🆔 ID: <code>{member.id}</code>
-
-Hᴀᴠᴇ Fᴜɴ Aɴᴅ Eɴᴊᴏʏ ✨""",
+                f"🎉 Wᴇʟᴄᴏᴍᴇ Tᴏ Tʜᴇ Gʀᴏᴜᴘ 🎉\n\n{mention}\n\n"
+                f"🆔 ID: <code>{member.id}</code>\n\n"
+                "Hᴀᴠᴇ Fᴜɴ Aɴᴅ Eɴᴊᴏʏ ✨",
                 parse_mode=ParseMode.HTML
             )
 
@@ -1138,13 +1390,14 @@ async def couples(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Active members kam hai. Group me thoda chat karo.")
         return
     user1, user2 = random.sample(members, 2)
+    bot_name = html.escape((await context.bot.get_me()).first_name or (await context.bot.get_me()).username or "Bot")
     caption = f"""❤️ TODAY'S CUTE COUPLE ❤️
 
 {mention_member(user1)} 🔥 💞 {mention_member(user2)}
 
 LOVE IS IN THE AIR ❤️
 
-~ FROM ADA WITH LOVE 💋"""
+~ FROM {bot_name.upper()} WITH LOVE 💋"""
     try:
         await context.bot.send_photo(chat_id, random.choice(COUPLE_PHOTOS), caption=caption, parse_mode=ParseMode.HTML)
     except:
@@ -2019,6 +2272,8 @@ COMMAND_MENU = [
     BotCommand("clone", "Make your own chatbot"),
     BotCommand("idclone", "Make your ID-chatbot"),
     BotCommand("unclone", "Remove your cloned bot"),
+    BotCommand("setwelcome", "Set group welcome message"),
+    BotCommand("delwelcome", "Reset group welcome message"),
 ]
 
 
@@ -2050,7 +2305,7 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are Ada. Sabse friendly tareeke se baat karo. Hindi me baat karo lekin English alphabets me. Short aur natural replies do. User jaise baat kare waise reply do. Human friend ki tarah behave karo."
+                    "content": f"You are {(await context.bot.get_me()).first_name or (await context.bot.get_me()).username or 'Bot'}. Be friendly, short and natural. {LANGUAGE_PROMPTS.get(get_user_language(update), LANGUAGE_PROMPTS['hinglish'])} Reply like a human friend and follow the user's tone."
                 },
                 {
                     "role": "user",
@@ -2075,10 +2330,14 @@ def build_application(token):
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("chatbot", chatbot))
+    app.add_handler(CommandHandler("lang", lang_cmd))
+    app.add_handler(CommandHandler("nsfwcheck", nsfwcheck))
     app.add_handler(CommandHandler(["tagall", "Tagall"], tagall))
     app.add_handler(CommandHandler("clone", clone_cmd))
     app.add_handler(CommandHandler("idclone", idclone_cmd))
     app.add_handler(CommandHandler(["unclone", "removeclone"], unclone_cmd))
+    app.add_handler(CommandHandler("setwelcome", setwelcome))
+    app.add_handler(CommandHandler("delwelcome", delwelcome))
 
     app.add_handler(CommandHandler("startconnectwin", connectwin))
     app.add_handler(CommandHandler("startchaingame", startchaingame))
@@ -2122,6 +2381,7 @@ def build_application(token):
     app.add_handler(CommandHandler("cry", cry))
 
     app.add_handler(CallbackQueryHandler(help_buttons, pattern="help_"))
+    app.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(hint_button, pattern="opphint:"))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
