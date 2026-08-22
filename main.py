@@ -15,7 +15,10 @@ from telegram import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    BotCommand
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -751,21 +754,38 @@ bbet 5+3
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_active(update)
+    me = await context.bot.get_me()
+    bot_username = me.username or ""
+    add_group_url = f"https://t.me/{bot_username}?startgroup=true" if bot_username else SUPPORT_LINK
+
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ", url=add_group_url)],
         [
-            InlineKeyboardButton("ꜱᴜᴘᴘᴏʀᴛ!", url=SUPPORT_LINK),
-            InlineKeyboardButton("ᴏᴡɴᴇʀ!", url=f"tg://user?id={OWNER_ID}")
+            InlineKeyboardButton("👑 ᴏᴡɴᴇʀ", url=f"tg://user?id={OWNER_ID}"),
+            InlineKeyboardButton("💬 ꜱᴜᴘᴘᴏʀᴛ", url=SUPPORT_LINK),
         ],
-        [InlineKeyboardButton("✅ ᴠᴇʀɪꜰʏ", callback_data="verify_join")]
     ])
-    caption = """💕 Hieeeeee
 
-ɪ'ᴍ ᴀᴅᴀ ✨
-ɪ ʜᴀᴠᴇ ᴀ ʟᴏᴛ ᴏꜰ ꜰᴇᴀᴛᴜʀᴇꜱ ɪɴ ᴛʜɪꜱ ʙᴏᴛ ꜱᴏ
-ᴜꜱᴇ /help ᴛᴏ ᴇxᴘʟᴏʀᴇ ᴍʏ ꜰᴇᴀᴛᴜʀᴇꜱ ....!
+    caption = """✨ <b>W E L C O M E</b> ✨
 
-ꜰɪʀꜱᴛ ᴊᴏɪɴ ꜱᴜᴘᴘᴏʀᴛ ᴄʜᴀɴɴᴇʟ ᴛʜᴇɴ ᴠᴇʀɪꜰʏ ✅"""
-    await update.message.reply_photo(photo=START_PHOTO, caption=caption, reply_markup=keyboard)
+╭───────────────╮
+│  🤖 <b>ᴍᴇᴇᴛ ᴀᴅᴀ</b>  │
+╰───────────────╯
+
+🌸 <b>Yᴏᴜʀ ꜰʀɪᴇɴᴅʟʏ ᴀɪ ᴄʜᴀᴛʙᴏᴛ</b>
+💫 Sᴍᴀʀᴛ • Fᴀsᴛ • Fᴜɴ
+🧠 Cʜᴀᴛ ᴡɪᴛʜ ᴍᴇ ɪɴ ɢʀᴏᴜᴘꜱ ᴏʀ ᴘʀɪᴠᴀᴛᴇ ᴄʜᴀᴛ
+🎮 Fᴜɴ • Gᴀᴍᴇꜱ • Eᴄᴏɴᴏᴍʏ • Mᴏʀᴇ
+
+💎 <i>Aᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ʟᴇᴛ'ꜱ ɢᴇᴛ ꜱᴛᴀʀᴛᴇᴅ!</i>
+
+♡ <b>Mᴀᴅᴇ ᴛᴏ ᴍᴀᴋᴇ ʏᴏᴜʀ ᴄʜᴀᴛ ᴍᴏʀᴇ ꜰᴜɴ ✨</b>"""
+    await update.message.reply_photo(
+        photo=START_PHOTO,
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1770,6 +1790,19 @@ async def sticker_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("Sticker Error:", e)
 
 
+async def set_command_menu(bot):
+    """Apply the slash-command menu explicitly to private chats, groups, and default scope."""
+    for scope in (
+        BotCommandScopeDefault(),
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+    ):
+        try:
+            await bot.set_my_commands(COMMAND_MENU, scope=scope)
+        except Exception as e:
+            print(f"Command menu setup failed for {scope.__class__.__name__}: {e}")
+
+
 async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Let any user connect a bot they control using its BotFather token.
 
@@ -1813,10 +1846,11 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clone_tokens.add(token)
         running_applications[str(me.id)] = application
         save_clone_record(token, update.effective_user.id, me.username or "", me.id)
-        await application.bot.set_my_commands(COMMAND_MENU)
+        await set_command_menu(application.bot)
         await update.message.reply_text(
             f"✅ Clone bot started: @{me.username}\n\n"
-            f"📢 Promotion receive karne ke liye users /promo on kar sakte hain."
+            f"📢 Promotion receive karne ke liye users /promo on kar sakte hain.\n"
+            f"🗑 Remove karne ke liye cloned bot me /unclone use karo."
         )
         try:
             await update.message.delete()
@@ -1824,7 +1858,76 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     except Exception as e:
         print("Clone start error:", e)
-        await update.message.reply_text("❌ Clone bot start nahi ho saka. Token/connection check karo.")
+        await update.message.reply_text(f"❌ Clone bot start nahi ho saka. Telegram connection/polling check karo.\n\nError: {e}")
+
+
+async def unclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove the current cloned bot. Only its creator or main owner can remove it."""
+    me = await context.bot.get_me()
+    bot_id = me.id
+    record = None
+    token = None
+
+    for saved_token, saved_record in clone_registry.items():
+        if int(saved_record.get("bot_id", 0)) == int(bot_id):
+            record = saved_record
+            token = saved_token
+            break
+
+    if not record or not token:
+        await update.message.reply_text("ℹ️ Ye main bot hai. Is bot ko /unclone se remove nahi kiya ja sakta.")
+        return
+
+    user_id = update.effective_user.id
+    owner_id = int(record.get("owner_id", 0))
+    if user_id != owner_id and user_id != OWNER_ID:
+        await update.message.reply_text("❌ Sirf is cloned bot ka owner ise remove kar sakta hai.")
+        return
+
+    try:
+        if mongo_clones is not None:
+            mongo_clones.update_one(
+                {"token": token},
+                {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}}
+            )
+    except Exception as e:
+        print("Mongo clone disable error:", e)
+
+    clone_registry.pop(token, None)
+    clone_tokens.discard(token)
+    clone_applications.pop(token, None)
+    running_applications.pop(str(bot_id), None)
+    save_data(CLONES_FILE, clone_registry)
+
+    await update.message.reply_text(
+        f"🗑 <b>@{html.escape(me.username or str(bot_id))}</b> remove kar diya gaya hai.\n\n"
+        "Ye bot ab Railway restart ke baad automatically start nahi hoga.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Stop this clone shortly after sending the confirmation message.
+    application = None
+    try:
+        application = context.application
+    except Exception:
+        pass
+
+    if application is not None:
+        async def shutdown_clone():
+            await asyncio.sleep(0.8)
+            try:
+                await application.updater.stop()
+            except Exception:
+                pass
+            try:
+                await application.stop()
+            except Exception:
+                pass
+            try:
+                await application.shutdown()
+            except Exception:
+                pass
+        asyncio.create_task(shutdown_clone())
 
 
 async def idclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1839,6 +1942,7 @@ COMMAND_MENU = [
     BotCommand("nsfwcheck", "Detect unsafe content"),
     BotCommand("clone", "Make your own chatbot"),
     BotCommand("idclone", "Make your ID-chatbot"),
+    BotCommand("unclone", "Remove your cloned bot"),
     BotCommand("promo", "Promotion messages on/off"),
 ]
 
@@ -1892,7 +1996,6 @@ def build_application(token):
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("chaingamehelp", chaingamehelp))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
@@ -1900,6 +2003,7 @@ def build_application(token):
     app.add_handler(CommandHandler(["tagall", "Tagall"], tagall))
     app.add_handler(CommandHandler("clone", clone_cmd))
     app.add_handler(CommandHandler("idclone", idclone_cmd))
+    app.add_handler(CommandHandler(["unclone", "removeclone"], unclone_cmd))
     app.add_handler(CommandHandler("promo", promo))
 
     app.add_handler(CommandHandler("startconnectwin", connectwin))
@@ -1943,7 +2047,6 @@ def build_application(token):
     app.add_handler(CommandHandler("dance", dance))
     app.add_handler(CommandHandler("cry", cry))
 
-    app.add_handler(CallbackQueryHandler(verify_join, pattern="verify_join"))
     app.add_handler(CallbackQueryHandler(help_buttons, pattern="help_"))
     app.add_handler(CallbackQueryHandler(hint_button, pattern="opphint:"))
 
@@ -1956,7 +2059,7 @@ def build_application(token):
 async def run_bot(token, label):
     application = build_application(token)
     await application.initialize()
-    await application.bot.set_my_commands(COMMAND_MENU)
+    await set_command_menu(application.bot)
     await application.start()
     await application.updater.start_polling()
     me = await application.bot.get_me()
