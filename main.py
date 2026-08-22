@@ -1012,32 +1012,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Only users who enabled /promo on receive promotions."
     )
 
-async def promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_chat:
-        return
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("ℹ️ Promotion settings DM me karke change karo: /promo on or /promo off")
-        return
-
-    bot_key = get_bot_key(update)
-    audience = promo_optins.setdefault(bot_key, [])
-    uid = update.effective_user.id
-    mode = context.args[0].lower() if context.args else "status"
-
-    if mode == "on":
-        if uid not in audience:
-            audience.append(uid)
-            save_data(PROMO_FILE, promo_optins)
-        await update.message.reply_text("✅ Promotional messages ON. Ab is bot ki promotions receive hongi.")
-    elif mode == "off":
-        if uid in audience:
-            audience.remove(uid)
-            save_data(PROMO_FILE, promo_optins)
-        await update.message.reply_text("❌ Promotional messages OFF. Ab promotion broadcasts receive nahi hongi.")
-    else:
-        status = "ON" if uid in audience else "OFF"
-        await update.message.reply_text(f"📢 Promotion status: {status}\nUse /promo on or /promo off")
-
 async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -1889,7 +1863,6 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ Clone bot started: @{me.username}\n\n"
-            f"📢 Promotion receive karne ke liye users /promo on kar sakte hain.\n"
             f"🗑 Remove karne ke liye cloned bot me /unclone use karo."
         )
         try:
@@ -2001,7 +1974,6 @@ COMMAND_MENU = [
     BotCommand("clone", "Make your own chatbot"),
     BotCommand("idclone", "Make your ID-chatbot"),
     BotCommand("unclone", "Remove your cloned bot"),
-    BotCommand("promo", "Promotion messages on/off"),
 ]
 
 
@@ -2062,7 +2034,6 @@ def build_application(token):
     app.add_handler(CommandHandler("clone", clone_cmd))
     app.add_handler(CommandHandler("idclone", idclone_cmd))
     app.add_handler(CommandHandler(["unclone", "removeclone"], unclone_cmd))
-    app.add_handler(CommandHandler("promo", promo))
 
     app.add_handler(CommandHandler("startconnectwin", connectwin))
     app.add_handler(CommandHandler("startchaingame", startchaingame))
