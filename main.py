@@ -167,18 +167,44 @@ def load_clone_registry():
     if mongo_clones is not None:
         try:
             docs = list(mongo_clones.find({"active": True}, {"_id": 0}))
-            clone_registry = {d["token"]: d for d in docs if d.get("token")}
+            normalized = {}
+            for d in docs:
+                token = d.get("token")
+                if not token:
+                    continue
+                if isinstance(d.get("updated_at"), datetime):
+                    d["updated_at"] = d["updated_at"].isoformat()
+                normalized[token] = d
+            clone_registry = normalized
+            # Refresh the JSON fallback from the normalized registry.
+            save_data(CLONES_FILE, clone_registry)
             return
         except Exception as e:
             print("Mongo clone load error:", e)
     clone_registry = load_data(CLONES_FILE, {})
 
 def save_clone_record(token, owner_id, username, bot_id):
-    record = {"token": token, "owner_id": int(owner_id), "username": username or "", "bot_id": int(bot_id), "active": True, "updated_at": datetime.now(timezone.utc)}
+    # MongoDB can store datetime natively, but the local JSON fallback cannot.
+    # Keep separate representations so adding a clone never fails with
+    # "Object of type datetime is not JSON serializable".
+    now = datetime.now(timezone.utc)
+    mongo_record = {
+        "token": token,
+        "owner_id": int(owner_id),
+        "username": username or "",
+        "bot_id": int(bot_id),
+        "active": True,
+        "updated_at": now,
+    }
+    local_record = dict(mongo_record)
+    local_record["updated_at"] = now.isoformat()
+
     if mongo_clones is not None:
-        mongo_clones.update_one({"token": token}, {"$set": record}, upsert=True)
-    clone_registry[token] = record
-    # Keep a local fallback/cache too.
+        mongo_clones.update_one({"token": token}, {"$set": mongo_record}, upsert=True)
+
+    # Runtime registry uses the JSON-safe representation so any later local
+    # cache write is always serializable.
+    clone_registry[token] = local_record
     save_data(CLONES_FILE, clone_registry)
 
 chatbot_status = {}
@@ -1837,16 +1863,30 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"ℹ️ @{me.username} already connected hai.")
         return
 
+    # Prevent the same bot from being started twice inside this process.
+    if str(me.id) in running_applications:
+        await update.message.reply_text(f"ℹ️ @{me.username} already connected hai.")
+        return
+
+    application = None
     try:
         application = build_application(token)
         await application.initialize()
+
+        # Start the application before polling. If another server/process is
+        # already polling this token, Telegram will reject the polling start
+        # and we will cleanly shut down this new application.
         await application.start()
-        await application.updater.start_polling()
+        await set_command_menu(application.bot)
+        await application.updater.start_polling(drop_pending_updates=True)
+
+        # Persist only after Telegram polling has actually started. This avoids
+        # leaving broken/invalid clones in MongoDB.
         clone_applications[token] = application
         clone_tokens.add(token)
         running_applications[str(me.id)] = application
         save_clone_record(token, update.effective_user.id, me.username or "", me.id)
-        await set_command_menu(application.bot)
+
         await update.message.reply_text(
             f"✅ Clone bot started: @{me.username}\n\n"
             f"📢 Promotion receive karne ke liye users /promo on kar sakte hain.\n"
@@ -1857,8 +1897,26 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     except Exception as e:
-        print("Clone start error:", e)
-        await update.message.reply_text(f"❌ Clone bot start nahi ho saka. Telegram connection/polling check karo.\n\nError: {e}")
+        print(f"Clone start error for @{me.username}: {type(e).__name__}: {e}")
+        # Do not save failed clones. Clean up partially started PTB objects.
+        if application is not None:
+            try:
+                await application.updater.stop()
+            except Exception:
+                pass
+            try:
+                await application.stop()
+            except Exception:
+                pass
+            try:
+                await application.shutdown()
+            except Exception:
+                pass
+        await update.message.reply_text(
+            "❌ Clone bot start nahi ho saka.\n\n"
+            "Token valid hona chahiye aur ye bot kisi doosre server/process par polling nahi kar raha hona chahiye.\n\n"
+            f"Error: {type(e).__name__}: {e}"
+        )
 
 
 async def unclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
