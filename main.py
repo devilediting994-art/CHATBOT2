@@ -7,12 +7,15 @@ import time
 from datetime import datetime, timezone
 
 from groq import Groq
+from pymongo import MongoClient
 
 from telegram import (
     Update,
+    Bot,
     ChatPermissions,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    BotCommand
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -39,6 +42,11 @@ ACTIVE_FILE = "active_members.json"
 GAME_BAN_FILE = "connect_game_banned.json"
 CONNECT_LB_FILE = "connect_leaderboard.json"
 ECONOMY_FILE = "economy.json"
+PROMO_FILE = "promo_optins.json"
+CLONES_FILE = "clones.json"
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chatbot2")
+MONGO_CLONES_COLLECTION = os.getenv("MONGO_CLONES_COLLECTION", "cloned_bots")
 
 START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
@@ -134,8 +142,48 @@ active_members = load_data(ACTIVE_FILE, {})
 game_banned = load_data(GAME_BAN_FILE, {})
 connect_leaderboard = load_data(CONNECT_LB_FILE, {})
 economy_data = load_data(ECONOMY_FILE, {})
+promo_optins = load_data(PROMO_FILE, {})
+clone_registry = load_data(CLONES_FILE, {})
+
+# MongoDB is used for persistent dynamic clones so Railway restarts do not lose them.
+mongo_client = None
+mongo_clones = None
+if MONGO_URI:
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command("ping")
+        mongo_clones = mongo_client[MONGO_DB_NAME][MONGO_CLONES_COLLECTION]
+        print("MongoDB connected for dynamic clones")
+    except Exception as e:
+        print("MongoDB connection failed; local clone storage will be used:", e)
+        mongo_client = None
+        mongo_clones = None
+
+def load_clone_registry():
+    global clone_registry
+    if mongo_clones is not None:
+        try:
+            docs = list(mongo_clones.find({"active": True}, {"_id": 0}))
+            clone_registry = {d["token"]: d for d in docs if d.get("token")}
+            return
+        except Exception as e:
+            print("Mongo clone load error:", e)
+    clone_registry = load_data(CLONES_FILE, {})
+
+def save_clone_record(token, owner_id, username, bot_id):
+    record = {"token": token, "owner_id": int(owner_id), "username": username or "", "bot_id": int(bot_id), "active": True, "updated_at": datetime.now(timezone.utc)}
+    if mongo_clones is not None:
+        mongo_clones.update_one({"token": token}, {"$set": record}, upsert=True)
+    clone_registry[token] = record
+    # Keep a local fallback/cache too.
+    save_data(CLONES_FILE, clone_registry)
+
 chatbot_status = {}
 connect_games = {}
+clone_applications = {}
+clone_tokens = set()
+running_applications = {}
+MAIN_BOT_ID = None
 
 def get_name(user):
     return user.first_name or "User"
@@ -146,11 +194,19 @@ def mention_user(user):
 def mention_member(member):
     return f'<a href="tg://user?id={member["id"]}">{html.escape(member["name"])}</a>'
 
+def get_bot_key(update: Update):
+    try:
+        return str(update.get_bot().id)
+    except Exception:
+        return "unknown"
+
 def track_active(update: Update):
     if not update.effective_user or not update.effective_chat:
         return
     chat = update.effective_chat
     user = update.effective_user
+    bot_key = get_bot_key(update)
+    promo_optins.setdefault(bot_key, [])
     if user.id not in users:
         users.append(user.id)
         save_data(USERS_FILE, users)
@@ -879,26 +935,62 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Users: {len(users)}\n📢 Groups: {len(groups)}")
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Main owner can promote across every running bot, but only to users
+    # who explicitly enabled promotional messages with /promo on.
     if update.effective_user.id != OWNER_ID:
         return
     msg = " ".join(context.args)
     if not msg:
         await update.message.reply_text("Usage: /broadcast message")
         return
-    sent_users = sent_groups = 0
-    for uid in users:
-        try:
-            await context.bot.send_message(uid, msg)
-            sent_users += 1
-        except:
-            pass
-    for gid in groups:
-        try:
-            await context.bot.send_message(gid, msg)
-            sent_groups += 1
-        except:
-            pass
-    await update.message.reply_text(f"✅ Broadcast Sent\nUsers: {sent_users}\nGroups: {sent_groups}")
+
+    bot_items = list(running_applications.items())
+    if not bot_items:
+        bot_items = [(str(context.bot.id), context.application)]
+
+    sent = failed = 0
+    for bot_id, application in bot_items:
+        audience = list(dict.fromkeys(promo_optins.get(str(bot_id), [])))
+        for uid in audience:
+            try:
+                await application.bot.send_message(int(uid), msg)
+                sent += 1
+            except Exception:
+                failed += 1
+
+    await update.message.reply_text(
+        f"📢 Promotion broadcast sent\n"
+        f"🤖 Bots: {len(bot_items)}\n"
+        f"✅ Delivered: {sent}\n"
+        f"❌ Failed: {failed}\n\n"
+        f"Only users who enabled /promo on receive promotions."
+    )
+
+async def promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("ℹ️ Promotion settings DM me karke change karo: /promo on or /promo off")
+        return
+
+    bot_key = get_bot_key(update)
+    audience = promo_optins.setdefault(bot_key, [])
+    uid = update.effective_user.id
+    mode = context.args[0].lower() if context.args else "status"
+
+    if mode == "on":
+        if uid not in audience:
+            audience.append(uid)
+            save_data(PROMO_FILE, promo_optins)
+        await update.message.reply_text("✅ Promotional messages ON. Ab is bot ki promotions receive hongi.")
+    elif mode == "off":
+        if uid in audience:
+            audience.remove(uid)
+            save_data(PROMO_FILE, promo_optins)
+        await update.message.reply_text("❌ Promotional messages OFF. Ab promotion broadcasts receive nahi hongi.")
+    else:
+        status = "ON" if uid in audience else "OFF"
+        await update.message.reply_text(f"📢 Promotion status: {status}\nUse /promo on or /promo off")
 
 async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -1678,6 +1770,79 @@ async def sticker_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("Sticker Error:", e)
 
 
+async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Let any user connect a bot they control using its BotFather token.
+
+    The token is validated with getMe and the command message is deleted
+    after reading it when Telegram permits deletion. Each clone keeps its
+    own promotional opt-in audience.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "🤖 Clone Bot\n\n"
+            "Apne BotFather token ke saath use karo:\n"
+            "/clone <BOT_TOKEN>\n\n"
+            "⚠️ Sirf us bot ka token use karo jise tum control karte ho.\n"
+            "Token bhejne ke baad command message delete kar diya jayega."
+        )
+        return
+
+    token = context.args[0].strip()
+    if ":" not in token or len(token) < 20:
+        await update.message.reply_text("❌ Invalid BotFather token.")
+        return
+
+    try:
+        temp_bot = Bot(token=token)
+        me = await temp_bot.get_me()
+        await temp_bot.close()
+    except Exception:
+        await update.message.reply_text("❌ Token invalid hai ya Telegram se verify nahi ho saka.")
+        return
+
+    if token == BOT_TOKEN or token in clone_tokens:
+        await update.message.reply_text(f"ℹ️ @{me.username} already connected hai.")
+        return
+
+    try:
+        application = build_application(token)
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        clone_applications[token] = application
+        clone_tokens.add(token)
+        running_applications[str(me.id)] = application
+        save_clone_record(token, update.effective_user.id, me.username or "", me.id)
+        await application.bot.set_my_commands(COMMAND_MENU)
+        await update.message.reply_text(
+            f"✅ Clone bot started: @{me.username}\n\n"
+            f"📢 Promotion receive karne ke liye users /promo on kar sakte hain."
+        )
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        print("Clone start error:", e)
+        await update.message.reply_text("❌ Clone bot start nahi ho saka. Token/connection check karo.")
+
+
+async def idclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await clone_cmd(update, context)
+
+
+COMMAND_MENU = [
+    BotCommand("start", "Start the bot"),
+    BotCommand("chatbot", "Chatbot On/Off"),
+    BotCommand("lang", "Select bot reply language for chat"),
+    BotCommand("tagall", "Tag all members in the group"),
+    BotCommand("nsfwcheck", "Detect unsafe content"),
+    BotCommand("clone", "Make your own chatbot"),
+    BotCommand("idclone", "Make your ID-chatbot"),
+    BotCommand("promo", "Promotion messages on/off"),
+]
+
+
 async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_active(update)
 
@@ -1694,8 +1859,6 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type in ["group", "supergroup"]:
         if chatbot_status.get(chat_id, True) is False:
             return
-
-
 
     if not client:
         return
@@ -1725,64 +1888,109 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ AI busy hai, thodi der baad try karo.")
 
 
-app = Application.builder().token(BOT_TOKEN).build()
+def build_application(token):
+    app = Application.builder().token(token).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("help", help_cmd))
-app.add_handler(CommandHandler("chaingamehelp", chaingamehelp))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("broadcast", broadcast))
-app.add_handler(CommandHandler("chatbot", chatbot))
-app.add_handler(CommandHandler(["tagall", "Tagall"], tagall))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("chaingamehelp", chaingamehelp))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("chatbot", chatbot))
+    app.add_handler(CommandHandler(["tagall", "Tagall"], tagall))
+    app.add_handler(CommandHandler("clone", clone_cmd))
+    app.add_handler(CommandHandler("idclone", idclone_cmd))
+    app.add_handler(CommandHandler("promo", promo))
 
-app.add_handler(CommandHandler("startconnectwin", connectwin))
-app.add_handler(CommandHandler("startchaingame", startchaingame))
-app.add_handler(CommandHandler("endconnectwin", endconnectwin))
-app.add_handler(CommandHandler("join", join_connect))
-app.add_handler(CommandHandler("cleaderboard", cleaderboard))
-app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
-app.add_handler(CommandHandler("daily", daily_cmd))
-app.add_handler(CommandHandler("give", give_cmd))
-app.add_handler(CommandHandler(["toprich", "leaderboard"], toprich_cmd))
-app.add_handler(CommandHandler("rank", rank_cmd))
-app.add_handler(CommandHandler("rob", rob_cmd))
-app.add_handler(CommandHandler("kill", kill_cmd))
-app.add_handler(CommandHandler("protect", protect_cmd))
-app.add_handler(CommandHandler(["shield", "protection"], shield_cmd))
-app.add_handler(CommandHandler("revive", revive_cmd))
-app.add_handler(CommandHandler("topkill", topkill_cmd))
-app.add_handler(CommandHandler("bet", bet_cmd))
-app.add_handler(CommandHandler(["games", "game"], games_cmd))
-app.add_handler(CommandHandler(["Baningame", "baningame"], baningame))
-app.add_handler(CommandHandler(["Unbaningame", "unbaningame"], unbaningame))
+    app.add_handler(CommandHandler("startconnectwin", connectwin))
+    app.add_handler(CommandHandler("startchaingame", startchaingame))
+    app.add_handler(CommandHandler("endconnectwin", endconnectwin))
+    app.add_handler(CommandHandler("join", join_connect))
+    app.add_handler(CommandHandler("cleaderboard", cleaderboard))
+    app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
+    app.add_handler(CommandHandler("daily", daily_cmd))
+    app.add_handler(CommandHandler("give", give_cmd))
+    app.add_handler(CommandHandler(["toprich", "leaderboard"], toprich_cmd))
+    app.add_handler(CommandHandler("rank", rank_cmd))
+    app.add_handler(CommandHandler("rob", rob_cmd))
+    app.add_handler(CommandHandler("kill", kill_cmd))
+    app.add_handler(CommandHandler("protect", protect_cmd))
+    app.add_handler(CommandHandler(["shield", "protection"], shield_cmd))
+    app.add_handler(CommandHandler("revive", revive_cmd))
+    app.add_handler(CommandHandler("topkill", topkill_cmd))
+    app.add_handler(CommandHandler("bet", bet_cmd))
+    app.add_handler(CommandHandler(["games", "game"], games_cmd))
+    app.add_handler(CommandHandler(["Baningame", "baningame"], baningame))
+    app.add_handler(CommandHandler(["Unbaningame", "unbaningame"], unbaningame))
 
-app.add_handler(CommandHandler(["ban", "Ban"], ban_user))
-app.add_handler(CommandHandler(["unban", "Unban"], unban_user))
-app.add_handler(CommandHandler(["mute", "Mute"], mute_user))
-app.add_handler(CommandHandler(["unmute", "Unmute"], unmute_user))
+    app.add_handler(CommandHandler(["ban", "Ban"], ban_user))
+    app.add_handler(CommandHandler(["unban", "Unban"], unban_user))
+    app.add_handler(CommandHandler(["mute", "Mute"], mute_user))
+    app.add_handler(CommandHandler(["unmute", "Unmute"], unmute_user))
 
-app.add_handler(CommandHandler("couples", couples))
-app.add_handler(CommandHandler("crush", crush))
-app.add_handler(CommandHandler("brain", brain))
-app.add_handler(CommandHandler("love", love))
+    app.add_handler(CommandHandler("couples", couples))
+    app.add_handler(CommandHandler("crush", crush))
+    app.add_handler(CommandHandler("brain", brain))
+    app.add_handler(CommandHandler("love", love))
 
-app.add_handler(CommandHandler("slap", slap))
-app.add_handler(CommandHandler("kiss", kiss))
-app.add_handler(CommandHandler("hug", hug))
-app.add_handler(CommandHandler("pat", pat))
-app.add_handler(CommandHandler("bite", bite))
-app.add_handler(CommandHandler("punch", punch))
-app.add_handler(CommandHandler("kill", kill))
-app.add_handler(CommandHandler("dance", dance))
-app.add_handler(CommandHandler("cry", cry))
+    app.add_handler(CommandHandler("slap", slap))
+    app.add_handler(CommandHandler("kiss", kiss))
+    app.add_handler(CommandHandler("hug", hug))
+    app.add_handler(CommandHandler("pat", pat))
+    app.add_handler(CommandHandler("bite", bite))
+    app.add_handler(CommandHandler("punch", punch))
+    app.add_handler(CommandHandler("kill", kill))
+    app.add_handler(CommandHandler("dance", dance))
+    app.add_handler(CommandHandler("cry", cry))
 
-app.add_handler(CallbackQueryHandler(verify_join, pattern="verify_join"))
-app.add_handler(CallbackQueryHandler(help_buttons, pattern="help_"))
-app.add_handler(CallbackQueryHandler(hint_button, pattern="opphint:"))
+    app.add_handler(CallbackQueryHandler(verify_join, pattern="verify_join"))
+    app.add_handler(CallbackQueryHandler(help_buttons, pattern="help_"))
+    app.add_handler(CallbackQueryHandler(hint_button, pattern="opphint:"))
 
-app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat))
+    return app
 
-print("Ada Bot Started...")
-app.run_polling()
+
+async def run_bot(token, label):
+    application = build_application(token)
+    await application.initialize()
+    await application.bot.set_my_commands(COMMAND_MENU)
+    await application.start()
+    await application.updater.start_polling()
+    me = await application.bot.get_me()
+    running_applications[str(me.id)] = application
+    global MAIN_BOT_ID
+    if label == "Main Bot":
+        MAIN_BOT_ID = me.id
+    print(f"{label} started: @{me.username}")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+
+async def run_all_bots():
+    load_clone_registry()
+    tokens = [BOT_TOKEN]
+
+    # Existing ENV clones are still supported for backward compatibility.
+    env_clone_tokens = os.getenv("CLONE_BOT_TOKENS", "")
+    if env_clone_tokens.strip():
+        tokens.extend([t.strip() for t in env_clone_tokens.split(",") if t.strip()])
+
+    # Dynamically added /clone bots are loaded from MongoDB after a Railway restart.
+    tokens.extend(clone_registry.keys())
+
+    unique_tokens = list(dict.fromkeys(t for t in tokens if t))
+    tasks = [run_bot(token, "Main Bot" if i == 0 else f"Clone {i}")
+             for i, token in enumerate(unique_tokens)]
+    print(f"Starting {len(tasks)} bot(s)...")
+    await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_all_bots())
