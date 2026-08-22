@@ -40,12 +40,12 @@ if not BOT_TOKEN:
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 USERS_FILE = "users.json"
+BOT_USERS_FILE = "bot_users.json"
 GROUPS_FILE = "groups.json"
 ACTIVE_FILE = "active_members.json"
 GAME_BAN_FILE = "connect_game_banned.json"
 CONNECT_LB_FILE = "connect_leaderboard.json"
 ECONOMY_FILE = "economy.json"
-PROMO_FILE = "promo_optins.json"
 CLONES_FILE = "clones.json"
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chatbot2")
@@ -140,12 +140,12 @@ def save_data(file, data):
         json.dump(data, f, indent=2)
 
 users = load_data(USERS_FILE, [])
+bot_users = load_data(BOT_USERS_FILE, {})
 groups = load_data(GROUPS_FILE, [])
 active_members = load_data(ACTIVE_FILE, {})
 game_banned = load_data(GAME_BAN_FILE, {})
 connect_leaderboard = load_data(CONNECT_LB_FILE, {})
 economy_data = load_data(ECONOMY_FILE, {})
-promo_optins = load_data(PROMO_FILE, {})
 clone_registry = load_data(CLONES_FILE, {})
 
 # MongoDB is used for persistent dynamic clones so Railway restarts do not lose them.
@@ -235,7 +235,10 @@ def track_active(update: Update):
     chat = update.effective_chat
     user = update.effective_user
     bot_key = get_bot_key(update)
-    promo_optins.setdefault(bot_key, [])
+    bot_users.setdefault(bot_key, [])
+    if user.id not in bot_users[bot_key]:
+        bot_users[bot_key].append(user.id)
+        save_data(BOT_USERS_FILE, bot_users)
     if user.id not in users:
         users.append(user.id)
         save_data(USERS_FILE, users)
@@ -981,10 +984,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Users: {len(users)}\n📢 Groups: {len(groups)}")
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Main owner can promote across every running bot, but only to users
-    # who explicitly enabled promotional messages with /promo on.
+    """Send a community announcement to users who have interacted with each bot."""
     if update.effective_user.id != OWNER_ID:
         return
+
     msg = " ".join(context.args)
     if not msg:
         await update.message.reply_text("Usage: /broadcast message")
@@ -996,7 +999,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent = failed = 0
     for bot_id, application in bot_items:
-        audience = list(dict.fromkeys(promo_optins.get(str(bot_id), [])))
+        # Each bot only sends to users who have previously interacted with that bot.
+        audience = list(dict.fromkeys(bot_users.get(str(bot_id), [])))
         for uid in audience:
             try:
                 await application.bot.send_message(int(uid), msg)
@@ -1005,11 +1009,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 failed += 1
 
     await update.message.reply_text(
-        f"📢 Promotion broadcast sent\n"
+        f"📢 Broadcast sent\n"
         f"🤖 Bots: {len(bot_items)}\n"
         f"✅ Delivered: {sent}\n"
-        f"❌ Failed: {failed}\n\n"
-        f"Only users who enabled /promo on receive promotions."
+        f"❌ Failed: {failed}"
     )
 
 async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
