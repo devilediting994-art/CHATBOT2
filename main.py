@@ -1695,13 +1695,7 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chatbot_status.get(chat_id, True) is False:
             return
 
-        # Group me bot sirf tab reply karega jab user bot ke message ko reply kare
-        if not update.message.reply_to_message:
-            return
 
-        replied_user = update.message.reply_to_message.from_user
-        if not replied_user or replied_user.id != context.bot.id:
-            return
 
     if not client:
         return
