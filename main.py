@@ -58,8 +58,8 @@ LANG_FILE = "languages.json"
 
 START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
-FORCE_CHANNEL = "@TH3GALAXY"
-SUPPORT_LINK = "https://t.me/+adNifJvmcZZlNjA9"
+FORCE_CHANNEL = "@JP_NETWORK"
+SUPPORT_LINK = "https://t.me/jp_network"
 
 JOIN_TIME = 30
 MAX_LEVELS = 10
@@ -1095,17 +1095,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"""✨ <b>W E L C O M E</b> ✨
 
 ╭───────────────╮
-│  🤖 <b>ᴍᴇᴇᴛ {bot_display_name_html}</b>  │
+│  🎀 <b>ᴍᴇᴇᴛ {bot_display_name_html}</b>  │
 ╰───────────────╯
 
-🌸 <b>Yᴏᴜʀ ꜰʀɪᴇɴᴅʟʏ ᴀɪ ᴄʜᴀᴛʙᴏᴛ</b>
+🌸 <b>ʜɪ, ɪ'ᴍ ʏᴏᴜʀ ғʀɪᴇɴᴅʟʏ ᴀɪ ɢɪʀʟ</b>
 💫 Sᴍᴀʀᴛ • Fᴀsᴛ • Fᴜɴ
 🧠 Cʜᴀᴛ ᴡɪᴛʜ ᴍᴇ ɪɴ ɢʀᴏᴜᴘꜱ ᴏʀ ᴘʀɪᴠᴀᴛᴇ ᴄʜᴀᴛ
-🎮 Fᴜɴ • Gᴀᴍᴇꜱ • Eᴄᴏɴᴏᴍʏ • Mᴏʀᴇ
+🎀 Fᴜɴ • Gᴀᴍᴇꜱ • Eᴄᴏɴᴏᴍʏ • Mᴏʀᴇ
 
 💎 <i>Aᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ʟᴇᴛ'ꜱ ɢᴇᴛ ꜱᴛᴀʀᴛᴇᴅ!</i>
 
-♡ <b>Mᴀᴅᴇ ᴛᴏ ᴍᴀᴋᴇ ʏᴏᴜʀ ᴄʜᴀᴛ ᴍᴏʀᴇ ꜰᴜɴ ✨</b>"""
+💗 <b>ɪ'ᴍ ʜᴇʀᴇ ᴛᴏ ᴄʜᴀᴛ, ʜᴇʟᴘ &amp; ᴍᴀᴋᴇ ʏᴏᴜʀ ᴄʜᴀᴛ ᴍᴏʀᴇ ғᴜɴ ✨</b>"""
     await update.message.reply_photo(
         photo=START_PHOTO,
         caption=caption,
@@ -2404,7 +2404,7 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are {(await context.bot.get_me()).first_name or (await context.bot.get_me()).username or 'Bot'}. Be friendly, short and natural. {LANGUAGE_PROMPTS.get(get_user_language(update), LANGUAGE_PROMPTS['hinglish'])} Reply like a human friend and follow the user's tone."
+                    "content": f"You are {(await context.bot.get_me()).first_name or (await context.bot.get_me()).username or 'Bot'}, a friendly female AI assistant. Use she/her identity when referring to yourself. Be warm, natural, helpful and conversational; do not claim to be a real human. Keep replies concise unless the user asks for detail. {LANGUAGE_PROMPTS.get(get_user_language(update), LANGUAGE_PROMPTS['hinglish'])} Reply like a human-friendly female assistant and follow the user's tone."
                 },
                 {
                     "role": "user",
