@@ -278,6 +278,11 @@ chatbot_status = {}
 connect_games = {}
 clone_applications = {}
 clone_tokens = set()
+
+# Short-lived conversation memory for natural, contextual replies.
+# Kept per bot + chat and capped so prompts stay small.
+CONVERSATION_HISTORY = {}
+MAX_HISTORY_MESSAGES = 12
 running_applications = {}
 MAIN_BOT_ID = None
 
@@ -1095,17 +1100,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"""✨ <b>W E L C O M E</b> ✨
 
 ╭───────────────╮
-│  🎀 <b>ᴍᴇᴇᴛ {bot_display_name_html}</b>  │
+│  🤖 <b>ᴍᴇᴇᴛ {bot_display_name_html}</b>  │
 ╰───────────────╯
 
-🌸 <b>ʜɪ, ɪ'ᴍ ʏᴏᴜʀ ғʀɪᴇɴᴅʟʏ ᴀɪ ɢɪʀʟ</b>
+🌸 <b>Yᴏᴜʀ ꜰʀɪᴇɴᴅʟʏ ᴀɪ ᴄʜᴀᴛʙᴏᴛ</b>
 💫 Sᴍᴀʀᴛ • Fᴀsᴛ • Fᴜɴ
 🧠 Cʜᴀᴛ ᴡɪᴛʜ ᴍᴇ ɪɴ ɢʀᴏᴜᴘꜱ ᴏʀ ᴘʀɪᴠᴀᴛᴇ ᴄʜᴀᴛ
-🎀 Fᴜɴ • Gᴀᴍᴇꜱ • Eᴄᴏɴᴏᴍʏ • Mᴏʀᴇ
+🎮 Fᴜɴ • Gᴀᴍᴇꜱ • Eᴄᴏɴᴏᴍʏ • Mᴏʀᴇ
 
 💎 <i>Aᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ʟᴇᴛ'ꜱ ɢᴇᴛ ꜱᴛᴀʀᴛᴇᴅ!</i>
 
-💗 <b>ɪ'ᴍ ʜᴇʀᴇ ᴛᴏ ᴄʜᴀᴛ, ʜᴇʟᴘ &amp; ᴍᴀᴋᴇ ʏᴏᴜʀ ᴄʜᴀᴛ ᴍᴏʀᴇ ғᴜɴ ✨</b>"""
+♡ <b>Mᴀᴅᴇ ᴛᴏ ᴍᴀᴋᴇ ʏᴏᴜʀ ᴄʜᴀᴛ ᴍᴏʀᴇ ꜰᴜɴ ✨</b>"""
     await update.message.reply_photo(
         photo=START_PHOTO,
         caption=caption,
@@ -1130,7 +1135,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     caption = """Cʟɪᴄᴋ ᴏɴ ᴛʜᴇ ʙᴜᴛᴛᴏɴs ʙᴇʟᴏᴡ ғᴏʀ ᴍᴏʀᴇ ɪɴғᴏʀᴍᴀᴛɪᴏɴ. Iғ ʏᴏᴜ'ʀᴇ ғᴀᴄɪɴɢ ᴀɴʏ ᴘʀᴏʙʟᴇᴍ ʏᴏᴜ ᴄᴀɴ ᴀsᴋ ɪɴ sᴜᴘᴘᴏʀᴛ ᴄʜᴀᴛ.
 
-Aʟʟ ᴄᴏᴍᴍᴀɴᴅs ᴄᴀɴ ʙᴇ ᴜsᴇᴅ ᴡɪᴛʜ: /"""
+Aʟʟ ᴄᴏᴍᴍᴀɴᴅs ᴄᴀɴ ʙᴇ ᴜsᴇᴅ ᴡɪᴛʜ: /
+
+✨ ᴍᴇɴᴜ ᴍᴇɪɴ ᴅɪᴋʜ ʀᴀʜᴇ ᴄᴏᴍᴍᴀɴᴅs ᴋᴏ ᴛᴀᴘ ᴋᴀʀᴋᴇ ᴜsᴇ ᴋᴀʀᴏ.
+"""
     await update.message.reply_photo(photo=HELP_PHOTO, caption=caption, reply_markup=keyboard)
 
 async def help_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1145,7 +1153,14 @@ async def help_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /chatbot off
 /stats
 /broadcast message
-/tagall message""",
+/tagall message
+/lang
+/nsfwcheck <text>
+/clone <BOT_TOKEN>
+/idclone <BOT_TOKEN>
+/unclone
+/setwelcome <message>
+/delwelcome""",
         "help_fun": """💕 ꜰᴜɴ ᴄᴏᴍᴍᴀɴᴅs
 
 /couples
@@ -2364,17 +2379,17 @@ async def idclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 COMMAND_MENU = [
     BotCommand("start", "Start the bot"),
-    BotCommand("chatbot", "Chatbot On/Off"),
-    BotCommand("lang", "Select bot reply language for chat"),
-    BotCommand("tagall", "Tag all members in the group"),
-    BotCommand("nsfwcheck", "Detect unsafe content"),
-    BotCommand("clone", "Make your own chatbot"),
-    BotCommand("idclone", "Make your ID-chatbot"),
+    BotCommand("help", "Show all features and commands"),
+    BotCommand("chatbot", "Turn group chatbot on/off"),
+    BotCommand("lang", "Choose your chat language"),
+    BotCommand("tagall", "Tag all group members"),
+    BotCommand("nsfwcheck", "Check text for unsafe content"),
+    BotCommand("clone", "Create/connect your chatbot"),
+    BotCommand("idclone", "Create your ID-chatbot"),
     BotCommand("unclone", "Remove your cloned bot"),
-    BotCommand("setwelcome", "Set group welcome message"),
-    BotCommand("delwelcome", "Reset group welcome message"),
+    BotCommand("setwelcome", "Set a group welcome message"),
+    BotCommand("delwelcome", "Reset the group welcome message"),
 ]
-
 
 async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_active(update)
@@ -2399,21 +2414,71 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     try:
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are {(await context.bot.get_me()).first_name or (await context.bot.get_me()).username or 'Bot'}, a friendly female AI assistant. Use she/her identity when referring to yourself. Be warm, natural, helpful and conversational; do not claim to be a real human. Keep replies concise unless the user asks for detail. {LANGUAGE_PROMPTS.get(get_user_language(update), LANGUAGE_PROMPTS['hinglish'])} Reply like a human-friendly female assistant and follow the user's tone."
-                },
-                {
-                    "role": "user",
-                    "content": user_text
-                }
-            ]
+        me = await context.bot.get_me()
+        bot_name = me.first_name or me.username or "Bot"
+        bot_key = str(me.id)
+        history_key = (bot_key, str(chat_id))
+
+        history = CONVERSATION_HISTORY.setdefault(history_key, [])
+
+        language = get_user_language(update)
+        language_instruction = LANGUAGE_PROMPTS.get(
+            language, LANGUAGE_PROMPTS["hinglish"]
         )
 
-        reply = response.choices[0].message.content
+        system_prompt = f"""You are {bot_name}, a friendly female AI chatbot.
+
+Your personality:
+- Warm, caring, playful, calm and emotionally aware.
+- Casual and conversational, like a supportive friend.
+- Never robotic, corporate, scripted or overly formal.
+- You are an AI and must not claim to be a human, but do not repeatedly announce that you are an AI.
+- Only mention that you are an AI when the user directly asks what you are, whether you are human, or otherwise needs that clarification.
+- Do not say 'as an AI' as a routine phrase.
+- Do not introduce yourself in every reply.
+- Do not mention your bot name in every reply.
+
+Conversation style:
+- Use the conversation history to understand references and continue naturally.
+- Reply to the actual message instead of giving generic advice.
+- Match the user's language, tone, spelling and texting style.
+- Simple/casual messages usually deserve short replies.
+- When the user shares feelings or a personal problem, listen first, acknowledge naturally, and gently ask something relevant when useful.
+- Do not force a question into every reply.
+- Use emojis naturally and sparingly; do not put emojis everywhere.
+- Avoid repetitive phrases and fixed templates.
+- Do not invent personal real-world experiences.
+- Do not encourage emotional dependency or suggest that the user should avoid trusted people.
+
+Language:
+{language_instruction}
+
+Examples of the tone (do not copy these literally):
+User: 'hello' -> 'Hii 😄 kya chal raha hai?'
+User: 'aaj mood kharab hai' -> 'Kya hua? 😕 Baat karni ho toh batao.'
+User: 'tum kon ho?' -> 'Main {bot_name} hoon 😊 ek friendly AI chatbot. Batao, kya scene hai?'
+
+Keep the conversation natural and context-aware."""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history[-MAX_HISTORY_MESSAGES:])
+        messages.append({"role": "user", "content": user_text})
+
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=messages
+        )
+
+        reply = (response.choices[0].message.content or "").strip()
+        if not reply:
+            return
+
+        # Save only the conversational text, not commands.
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY_MESSAGES:
+            del history[:-MAX_HISTORY_MESSAGES]
+
         await update.message.reply_text(reply[:4000])
 
     except Exception as e:
@@ -2425,6 +2490,7 @@ def build_application(token):
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("chaingamehelp", chaingamehelp))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
