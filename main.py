@@ -58,8 +58,8 @@ LANG_FILE = "languages.json"
 
 START_PHOTO = "https://kommodo.ai/i/IOLcEhfHnTNODGFnUBQI"
 HELP_PHOTO = START_PHOTO
-FORCE_CHANNEL = "@JP_NETWORK"
-SUPPORT_LINK = "https://t.me/jp_network"
+FORCE_CHANNEL = "@TH3GALAXY"
+SUPPORT_LINK = "https://t.me/+adNifJvmcZZlNjA9"
 
 JOIN_TIME = 30
 MAX_LEVELS = 10
