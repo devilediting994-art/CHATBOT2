@@ -222,10 +222,32 @@ def load_bot_users_registry():
 
 
 def save_clone_record(token, owner_id, username, bot_id):
-    # MongoDB can store datetime natively, but the local JSON fallback cannot.
-    # Keep separate representations so adding a clone never fails with
-    # "Object of type datetime is not JSON serializable".
+    """Persist a clone without ever changing ownership of an active clone.
+
+    The first successful /clone claimant remains the owner until the clone is
+    explicitly un-cloned. This prevents a second user who somehow has the
+    same token from overwriting owner_id.
+    """
     now = datetime.now(timezone.utc)
+
+    existing = clone_registry.get(token)
+    if existing and bool(existing.get("active", True)):
+        return False
+
+    if mongo_clones is not None:
+        try:
+            existing_mongo = mongo_clones.find_one({"token": token, "active": True}, {"_id": 0})
+            if existing_mongo:
+                # Never overwrite an active clone's owner.
+                safe_existing = dict(existing_mongo)
+                if isinstance(safe_existing.get("updated_at"), datetime):
+                    safe_existing["updated_at"] = safe_existing["updated_at"].isoformat()
+                clone_registry[token] = safe_existing
+                save_data(CLONES_FILE, clone_registry)
+                return False
+        except Exception as e:
+            print("Mongo clone ownership check error:", e)
+
     mongo_record = {
         "token": token,
         "owner_id": int(owner_id),
@@ -238,12 +260,19 @@ def save_clone_record(token, owner_id, username, bot_id):
     local_record["updated_at"] = now.isoformat()
 
     if mongo_clones is not None:
-        mongo_clones.update_one({"token": token}, {"$set": mongo_record}, upsert=True)
+        # $setOnInsert is deliberate: an existing active record's owner_id
+        # can never be replaced by a later /clone call.
+        result = mongo_clones.update_one(
+            {"token": token, "active": {"$ne": True}},
+            {"$set": mongo_record},
+            upsert=True,
+        )
+        if result.matched_count == 0 and not result.upserted_id:
+            return False
 
-    # Runtime registry uses the JSON-safe representation so any later local
-    # cache write is always serializable.
     clone_registry[token] = local_record
     save_data(CLONES_FILE, clone_registry)
+    return True
 
 chatbot_status = {}
 connect_games = {}
@@ -2135,6 +2164,32 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"ℹ️ @{me.username} already connected hai.")
         return
 
+    # Check the persistent registry before starting anything. The first active
+    # owner of this token must remain the owner; another user cannot reclaim
+    # or overwrite the clone simply by supplying the same token.
+    existing_record = clone_registry.get(token)
+    if existing_record and bool(existing_record.get("active", True)):
+        await update.message.reply_text(
+            f"🔒 @{me.username} already connected hai.\n"
+            "Is clone ka owner change nahi kiya ja sakta."
+        )
+        return
+    if mongo_clones is not None:
+        try:
+            existing_record = mongo_clones.find_one({"token": token, "active": True}, {"_id": 0})
+            if existing_record:
+                clone_registry[token] = existing_record
+                if isinstance(clone_registry[token].get("updated_at"), datetime):
+                    clone_registry[token]["updated_at"] = clone_registry[token]["updated_at"].isoformat()
+                save_data(CLONES_FILE, clone_registry)
+                await update.message.reply_text(
+                    f"🔒 @{me.username} already connected hai.\n"
+                    "Is clone ka owner change nahi kiya ja sakta."
+                )
+                return
+        except Exception as e:
+            print("Mongo clone lookup error:", e)
+
     # Prevent the same bot from being started twice inside this process.
     if str(me.id) in running_applications:
         await update.message.reply_text(f"ℹ️ @{me.username} already connected hai.")
@@ -2157,7 +2212,30 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clone_applications[token] = application
         clone_tokens.add(token)
         running_applications[str(me.id)] = application
-        save_clone_record(token, update.effective_user.id, me.username or "", me.id)
+        claimed = save_clone_record(token, update.effective_user.id, me.username or "", me.id)
+        if not claimed:
+            # A concurrent clone request won the ownership claim. Do not leave
+            # this extra polling process running.
+            try:
+                await application.updater.stop()
+            except Exception:
+                pass
+            try:
+                await application.stop()
+            except Exception:
+                pass
+            try:
+                await application.shutdown()
+            except Exception:
+                pass
+            clone_applications.pop(token, None)
+            clone_tokens.discard(token)
+            running_applications.pop(str(me.id), None)
+            await update.message.reply_text(
+                f"🔒 @{me.username} already connected hai.\n"
+                "Is clone ka owner change nahi kiya ja sakta."
+            )
+            return
 
         await update.message.reply_text(
             f"✅ Clone bot started: @{me.username}\n\n"
@@ -2191,72 +2269,93 @@ async def clone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove the current cloned bot. Only its creator or main owner can remove it."""
+    """Remove a cloned bot.
+
+    - Inside a cloned bot: its creator (or main owner) can remove that clone.
+    - Inside the main bot: only OWNER_ID can remove a clone by passing its token.
+      Example: /unclone <BOT_TOKEN>
+    """
     me = await context.bot.get_me()
-    bot_id = me.id
-    record = None
-    token = None
+    current_bot_id = int(me.id)
+    # MAIN_BOT_ID is set from the configured BOT_TOKEN at startup. If it is
+    # unavailable, fall back to the explicit configured token identity by
+    # checking Telegram getMe once.
+    is_main = (MAIN_BOT_ID is not None and current_bot_id == int(MAIN_BOT_ID))
+    if MAIN_BOT_ID is None:
+        try:
+            main_me = await Bot(token=BOT_TOKEN).get_me()
+            is_main = int(main_me.id) == current_bot_id
+        except Exception:
+            is_main = False
 
-    for saved_token, saved_record in clone_registry.items():
-        if int(saved_record.get("bot_id", 0)) == int(bot_id):
-            record = saved_record
-            token = saved_token
-            break
+    target_token = None
+    target_record = None
 
-    if not record or not token:
-        await update.message.reply_text("ℹ️ Ye main bot hai. Is bot ko /unclone se remove nahi kiya ja sakta.")
-        return
-
-    user_id = update.effective_user.id
-    owner_id = int(record.get("owner_id", 0))
-    if user_id != owner_id and user_id != OWNER_ID:
-        await update.message.reply_text("❌ Sirf is cloned bot ka owner ise remove kar sakta hai.")
-        return
+    # Main bot owner can remove a clone by token.
+    if is_main:
+        if update.effective_user.id != OWNER_ID:
+            await update.message.reply_text("❌ Sirf main bot owner cloned bots remove kar sakta hai.")
+            return
+        if not context.args:
+            await update.message.reply_text("ℹ️ Main bot se clone remove karne ke liye:\n/unclone <BOT_TOKEN>")
+            return
+        target_token = context.args[0].strip()
+        target_record = clone_registry.get(target_token)
+        if not target_record:
+            await update.message.reply_text("❌ Ye bot cloned registry mein nahi mila.")
+            return
+    else:
+        # Inside a clone, identify the current clone from its bot id.
+        for saved_token, saved_record in clone_registry.items():
+            if int(saved_record.get("bot_id", 0)) == current_bot_id:
+                target_token = saved_token
+                target_record = saved_record
+                break
+        if not target_token or not target_record:
+            await update.message.reply_text("ℹ️ Ye main bot hai. Is bot ko /unclone se remove nahi kiya ja sakta.")
+            return
+        user_id = update.effective_user.id
+        owner_id = int(target_record.get("owner_id", 0))
+        if user_id != owner_id and user_id != OWNER_ID:
+            await update.message.reply_text("❌ Sirf is cloned bot ka owner ise remove kar sakta hai.")
+            return
 
     try:
         if mongo_clones is not None:
             mongo_clones.update_one(
-                {"token": token},
+                {"token": target_token},
                 {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}}
             )
     except Exception as e:
         print("Mongo clone disable error:", e)
 
-    clone_registry.pop(token, None)
-    clone_tokens.discard(token)
-    clone_applications.pop(token, None)
-    running_applications.pop(str(bot_id), None)
-    save_data(CLONES_FILE, clone_registry)
+    clone_registry.pop(target_token, None)
+    clone_tokens.discard(target_token)
 
-    await update.message.reply_text(
-        f"🗑 <b>@{html.escape(me.username or str(bot_id))}</b> remove kar diya gaya hai.\n\n"
-        "Ye bot ab Railway restart ke baad automatically start nahi hoga.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    # Stop this clone shortly after sending the confirmation message.
-    application = None
-    try:
-        application = context.application
-    except Exception:
-        pass
+    record = target_record or {}
+    target_bot_id = str(record.get("bot_id", ""))
+    application = clone_applications.pop(target_token, None)
+    if application is None and target_bot_id:
+        application = running_applications.pop(target_bot_id, None)
+    else:
+        running_applications.pop(target_bot_id, None)
 
     if application is not None:
-        async def shutdown_clone():
-            await asyncio.sleep(0.8)
-            try:
-                await application.updater.stop()
-            except Exception:
-                pass
-            try:
-                await application.stop()
-            except Exception:
-                pass
-            try:
-                await application.shutdown()
-            except Exception:
-                pass
-        asyncio.create_task(shutdown_clone())
+        try:
+            await application.updater.stop()
+        except Exception:
+            pass
+        try:
+            await application.stop()
+        except Exception:
+            pass
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
+
+    username = record.get("username") or "cloned bot"
+    await update.message.reply_text(f"✅ @{username} successfully unclone/remove kar diya gaya.")
 
 
 async def idclone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
