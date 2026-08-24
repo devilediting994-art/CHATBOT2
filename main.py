@@ -26,6 +26,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters
 )
@@ -41,7 +42,6 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 USERS_FILE = "users.json"
 BOT_USERS_FILE = "bot_users.json"
-BOT_GROUPS_FILE = "bot_groups.json"
 GROUPS_FILE = "groups.json"
 ACTIVE_FILE = "active_members.json"
 GAME_BAN_FILE = "connect_game_banned.json"
@@ -53,6 +53,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chatbot2")
 MONGO_CLONES_COLLECTION = os.getenv("MONGO_CLONES_COLLECTION", "cloned_bots")
 MONGO_BOT_USERS_COLLECTION = os.getenv("MONGO_BOT_USERS_COLLECTION", "bot_users")
+MONGO_BOT_GROUPS_COLLECTION = os.getenv("MONGO_BOT_GROUPS_COLLECTION", "bot_groups")
 MONGO_WELCOMES_COLLECTION = os.getenv("MONGO_WELCOMES_COLLECTION", "group_welcomes")
 MONGO_LANG_COLLECTION = os.getenv("MONGO_LANG_COLLECTION", "user_languages")
 LANG_FILE = "languages.json"
@@ -147,7 +148,7 @@ def save_data(file, data):
 
 users = load_data(USERS_FILE, [])
 bot_users = load_data(BOT_USERS_FILE, {})
-bot_groups = load_data(BOT_GROUPS_FILE, {})
+bot_groups = load_data("bot_groups.json", {})
 groups = load_data(GROUPS_FILE, [])
 active_members = load_data(ACTIVE_FILE, {})
 game_banned = load_data(GAME_BAN_FILE, {})
@@ -162,6 +163,7 @@ languages = load_data(LANG_FILE, {})
 mongo_client = None
 mongo_clones = None
 mongo_bot_users = None
+mongo_bot_groups = None
 mongo_welcomes = None
 mongo_languages = None
 if MONGO_URI:
@@ -171,6 +173,7 @@ if MONGO_URI:
         db = mongo_client[MONGO_DB_NAME]
         mongo_clones = db[MONGO_CLONES_COLLECTION]
         mongo_bot_users = db[MONGO_BOT_USERS_COLLECTION]
+        mongo_bot_groups = db[MONGO_BOT_GROUPS_COLLECTION]
         mongo_welcomes = db[MONGO_WELCOMES_COLLECTION]
         mongo_languages = db[MONGO_LANG_COLLECTION]
         print("MongoDB connected for dynamic clones, bot users, and group welcomes")
@@ -179,6 +182,7 @@ if MONGO_URI:
         mongo_client = None
         mongo_clones = None
         mongo_bot_users = None
+        mongo_bot_groups = None
         mongo_welcomes = None
     mongo_languages = None
 
@@ -202,6 +206,25 @@ def load_clone_registry():
         except Exception as e:
             print("Mongo clone load error:", e)
     clone_registry = load_data(CLONES_FILE, {})
+
+def load_bot_groups_registry():
+    """Load persistent per-bot group audiences from MongoDB."""
+    global bot_groups
+    if mongo_bot_groups is not None:
+        try:
+            loaded = {}
+            for doc in mongo_bot_groups.find({}, {"_id": 0, "bot_id": 1, "group_ids": 1}):
+                bot_id = str(doc.get("bot_id", ""))
+                if bot_id:
+                    loaded[bot_id] = [int(x) for x in (doc.get("group_ids") or [])]
+            if loaded:
+                bot_groups = loaded
+                save_data("bot_groups.json", bot_groups)
+                print(f"Loaded bot group audiences for {len(bot_groups)} bot(s)")
+                return
+        except Exception as e:
+            print("Mongo bot group load error:", e)
+    bot_groups = load_data("bot_groups.json", bot_groups)
 
 def load_bot_users_registry():
     """Load persistent per-bot user audiences from MongoDB."""
@@ -303,6 +326,77 @@ def get_bot_key(update: Update):
     except Exception:
         return "unknown"
 
+def track_bot_group(update: Update, chat=None, bot_id=None):
+    """Persist the fact that this specific bot is currently in a group."""
+    global bot_groups
+    chat = chat or update.effective_chat
+    if not chat or chat.type not in ["group", "supergroup"]:
+        return
+    if bot_id is None:
+        try:
+            bot_id = int(update.get_bot().id)
+        except Exception:
+            return
+    key = str(bot_id)
+    bot_groups.setdefault(key, [])
+    if int(chat.id) not in bot_groups[key]:
+        bot_groups[key].append(int(chat.id))
+        save_data("bot_groups.json", bot_groups)
+        if mongo_bot_groups is not None:
+            try:
+                mongo_bot_groups.update_one(
+                    {"bot_id": key},
+                    {"$addToSet": {"group_ids": int(chat.id)}},
+                    upsert=True,
+                )
+            except Exception as e:
+                print("Mongo bot group save error:", e)
+    if chat.id not in groups:
+        groups.append(chat.id)
+        save_data(GROUPS_FILE, groups)
+
+async def bot_membership_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track bot add/remove events so groups are known even before a user messages the bot."""
+    cm = update.my_chat_member
+    if not cm or not cm.chat or cm.chat.type not in ["group", "supergroup"]:
+        return
+    new_status = cm.new_chat_member.status
+    old_status = cm.old_chat_member.status
+    try:
+        bot_id = int(context.bot.id)
+    except Exception:
+        return
+    key = str(bot_id)
+    bot_groups.setdefault(key, [])
+    if new_status in {"member", "administrator", "creator", "restricted"}:
+        if cm.chat.id not in bot_groups[key]:
+            bot_groups[key].append(int(cm.chat.id))
+            save_data("bot_groups.json", bot_groups)
+        if mongo_bot_groups is not None:
+            try:
+                mongo_bot_groups.update_one(
+                    {"bot_id": key},
+                    {"$addToSet": {"group_ids": int(cm.chat.id)}},
+                    upsert=True,
+                )
+            except Exception as e:
+                print("Mongo bot group add error:", e)
+        if cm.chat.id not in groups:
+            groups.append(cm.chat.id)
+            save_data(GROUPS_FILE, groups)
+    elif new_status in {"left", "kicked"}:
+        bot_groups[key] = [gid for gid in bot_groups.get(key, []) if gid != int(cm.chat.id)]
+        save_data("bot_groups.json", bot_groups)
+        if mongo_bot_groups is not None:
+            try:
+                mongo_bot_groups.update_one(
+                    {"bot_id": key},
+                    {"$pull": {"group_ids": int(cm.chat.id)}},
+                    upsert=True,
+                )
+            except Exception as e:
+                print("Mongo bot group remove error:", e)
+
 def track_active(update: Update):
     if not update.effective_user or not update.effective_chat:
         return
@@ -310,35 +404,24 @@ def track_active(update: Update):
     user = update.effective_user
     bot_key = get_bot_key(update)
     bot_users.setdefault(bot_key, [])
-    bot_groups.setdefault(bot_key, [])
-    changed = False
     if user.id not in bot_users[bot_key]:
         bot_users[bot_key].append(user.id)
-        changed = True
-    if chat.type in ["group", "supergroup"] and chat.id not in bot_groups[bot_key]:
-        bot_groups[bot_key].append(chat.id)
-        changed = True
-    if changed:
         save_data(BOT_USERS_FILE, bot_users)
-        save_data(BOT_GROUPS_FILE, bot_groups)
         if mongo_bot_users is not None and bot_key != "unknown":
             try:
-                update_fields = {"$addToSet": {"user_ids": int(user.id)}}
-                if chat.type in ["group", "supergroup"]:
-                    update_fields["$addToSet"]["group_ids"] = int(chat.id)
                 mongo_bot_users.update_one(
-                    {"bot_id": bot_key}, update_fields, upsert=True
+                    {"bot_id": bot_key},
+                    {"$addToSet": {"user_ids": int(user.id)}},
+                    upsert=True,
                 )
             except Exception as e:
-                print("Mongo bot audience save error:", e)
+                print("Mongo bot user save error:", e)
     if user.id not in users:
         users.append(user.id)
         save_data(USERS_FILE, users)
     if chat.type not in ["group", "supergroup"]:
         return
-    if chat.id not in groups:
-        groups.append(chat.id)
-        save_data(GROUPS_FILE, groups)
+    track_bot_group(update, chat=chat, bot_id=bot_key if bot_key.isdigit() else None)
     cid = str(chat.id)
     active_members.setdefault(cid, [])
     active_members[cid] = [m for m in active_members[cid] if m["id"] != user.id]
@@ -1306,88 +1389,103 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"👥 Users: {len(users)}\n📢 Groups: {len(groups)}")
 
-async def _broadcast_targets(context, mode, text):
-    """Broadcast to this bot's saved DMs and groups. Returns (sent, failed, pinned)."""
-    bot_id = str(context.bot.id)
-    user_ids = set(int(x) for x in bot_users.get(bot_id, []))
-    group_ids = set(int(x) for x in bot_groups.get(bot_id, []))
+async def _broadcast_to_audience(update: Update, context: ContextTypes.DEFAULT_TYPE, mode="simple"):
+    """Broadcast to all known DMs and groups across every running bot.
 
-    # Restore persistent audience from MongoDB after Railway restarts.
-    if mongo_bot_users is not None:
-        try:
-            doc = mongo_bot_users.find_one({"bot_id": bot_id}, {"user_ids": 1, "group_ids": 1}) or {}
-            user_ids.update(int(x) for x in doc.get("user_ids", []) if str(x).lstrip("-").isdigit())
-            group_ids.update(int(x) for x in doc.get("group_ids", []) if str(x).lstrip("-").isdigit())
-        except Exception as e:
-            print("Mongo broadcast audience read error:", e)
-
-    sent = failed = pinned = 0
-    pin_dm = mode in ("dm_pin", "all_pin")
-    pin_group = mode in ("group_pin", "all_pin")
-
-    for chat_id in sorted(user_ids):
-        try:
-            m = await context.bot.send_message(chat_id, text)
-            sent += 1
-            if pin_dm:
-                try:
-                    await context.bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
-                    pinned += 1
-                except Exception as e:
-                    print(f"DM pin failed for {chat_id}: {type(e).__name__}: {e}")
-        except Exception as e:
-            failed += 1
-            print(f"DM broadcast failed for {chat_id}: {type(e).__name__}: {e}")
-
-    for chat_id in sorted(group_ids):
-        try:
-            m = await context.bot.send_message(chat_id, text)
-            sent += 1
-            if pin_group:
-                try:
-                    await context.bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
-                    pinned += 1
-                except Exception as e:
-                    print(f"Group pin failed for {chat_id}: {type(e).__name__}: {e}")
-        except Exception as e:
-            failed += 1
-            print(f"Group broadcast failed for {chat_id}: {type(e).__name__}: {e}")
-
-    return sent, failed, pinned, len(user_ids), len(group_ids)
-
-async def _run_broadcast(update, context, mode, label):
+    mode: simple | pin_all | pin_groups | pin_dms
+    """
     if update.effective_user.id != OWNER_ID:
         return
+
     msg = " ".join(context.args).strip()
-    if not msg and update.message.reply_to_message:
-        msg = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
     if not msg:
-        await update.message.reply_text(
-            f"Usage: /{label} message\nOr reply to a message with /{label}"
-        )
+        await update.message.reply_text("Usage: /broadcast message")
         return
-    sent, failed, pinned, dm_count, group_count = await _broadcast_targets(context, mode, msg)
+
+    bot_items = list(running_applications.items())
+    if not bot_items:
+        bot_items = [(str(context.bot.id), context.application)]
+
+    total_dms = total_groups = delivered = failed = pinned = pin_failed = 0
+    seen_dm = set()
+    seen_group = set()
+
+    for bot_id, application in bot_items:
+        bot_key = str(bot_id)
+        dm_ids = [int(x) for x in bot_users.get(bot_key, [])]
+        group_ids = [int(x) for x in bot_groups.get(bot_key, [])]
+
+        # Main bot may have older group records in groups.json. Only use these
+        # as a fallback for the current main bot, because old data predates the
+        # per-bot registry.
+        if bot_key == str(context.bot.id) and not group_ids:
+            group_ids = [int(x) for x in groups]
+
+        for uid in dm_ids:
+            if uid in seen_dm:
+                continue
+            seen_dm.add(uid)
+            total_dms += 1
+            try:
+                sent_msg = await application.bot.send_message(chat_id=uid, text=msg)
+                delivered += 1
+                if mode in {"pin_all", "pin_dms"}:
+                    try:
+                        await application.bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id)
+                        pinned += 1
+                    except Exception as e:
+                        pin_failed += 1
+                        print(f"DM pin failed for {uid}: {type(e).__name__}: {e}")
+            except Exception as e:
+                failed += 1
+                print(f"DM broadcast failed for {uid}: {type(e).__name__}: {e}")
+
+        for gid in group_ids:
+            if gid in seen_group:
+                continue
+            seen_group.add(gid)
+            total_groups += 1
+            try:
+                sent_msg = await application.bot.send_message(chat_id=gid, text=msg)
+                delivered += 1
+                if mode in {"pin_all", "pin_groups"}:
+                    try:
+                        await application.bot.pin_chat_message(chat_id=gid, message_id=sent_msg.message_id)
+                        pinned += 1
+                    except Exception as e:
+                        pin_failed += 1
+                        print(f"Group pin failed for {gid}: {type(e).__name__}: {e}")
+            except Exception as e:
+                failed += 1
+                print(f"Group broadcast failed for {gid}: {type(e).__name__}: {e}")
+
+    title = {
+        "simple": "📢 Broadcast complete",
+        "pin_all": "📌 Broadcast + pin complete",
+        "pin_groups": "📌 Group broadcast + pin complete",
+        "pin_dms": "📌 DM broadcast + pin attempt complete",
+    }.get(mode, "📢 Broadcast complete")
+
+    extra = f"\n📌 Pinned: {pinned}\n⚠️ Pin failed: {pin_failed}" if mode != "simple" else ""
     await update.message.reply_text(
-        f"📢 <b>Broadcast complete</b>\n\n"
-        f"💬 DMs found: {dm_count}\n"
-        f"👥 Groups found: {group_count}\n"
-        f"✅ Delivered: {sent}\n"
-        f"❌ Failed: {failed}\n"
-        f"📌 Pinned: {pinned}",
-        parse_mode=ParseMode.HTML,
+        f"{title}\n\n"
+        f"💬 DMs found: {total_dms}\n"
+        f"👥 Groups found: {total_groups}\n"
+        f"✅ Delivered: {delivered}\n"
+        f"❌ Failed: {failed}{extra}"
     )
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_broadcast(update, context, "simple", "broadcast")
+    await _broadcast_to_audience(update, context, "simple")
 
 async def broadcast_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_broadcast(update, context, "all_pin", "broadcastpin")
+    await _broadcast_to_audience(update, context, "pin_all")
 
 async def broadcast_group_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_broadcast(update, context, "group_pin", "broadcastgrouppin")
+    await _broadcast_to_audience(update, context, "pin_groups")
 
 async def broadcast_dm_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _run_broadcast(update, context, "dm_pin", "broadcastdmpin")
+    await _broadcast_to_audience(update, context, "pin_dms")
 
 async def chatbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -1423,23 +1521,6 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_name = bot_info.first_name or bot_info.username or "Bot"
     except Exception:
         bot_name = "Bot"
-
-    # A bot being added to a group may not trigger track_active(), so persist the group immediately.
-    try:
-        bot_key = str(context.bot.id)
-        chat_id = int(update.effective_chat.id)
-        bot_groups.setdefault(bot_key, [])
-        if chat_id not in bot_groups[bot_key]:
-            bot_groups[bot_key].append(chat_id)
-            save_data(BOT_GROUPS_FILE, bot_groups)
-            if mongo_bot_users is not None:
-                mongo_bot_users.update_one(
-                    {"bot_id": bot_key},
-                    {"$addToSet": {"group_ids": chat_id}},
-                    upsert=True,
-                )
-    except Exception as e:
-        print("Group registration error:", e)
 
     for member in update.message.new_chat_members:
         mention = f'<a href="tg://user?id={member.id}">{html.escape(member.first_name or "User")}</a>'
@@ -2454,6 +2535,10 @@ COMMAND_MENU = [
     BotCommand("chatbot", "Turn group chatbot on/off"),
     BotCommand("lang", "Choose your chat language"),
     BotCommand("tagall", "Tag all group members"),
+    BotCommand("broadcast", "Broadcast to DMs and groups"),
+    BotCommand("broadcastpin", "Broadcast and pin in DMs and groups"),
+    BotCommand("broadcastgrouppin", "Broadcast and pin in groups"),
+    BotCommand("broadcastdmpin", "Broadcast and pin in DMs"),
     BotCommand("nsfwcheck", "Check text for unsafe content"),
     BotCommand("clone", "Create/connect your chatbot"),
     BotCommand("idclone", "Create your ID-chatbot"),
@@ -2616,6 +2701,7 @@ def build_application(token):
     app.add_handler(CommandHandler("broadcastpin", broadcast_pin))
     app.add_handler(CommandHandler("broadcastgrouppin", broadcast_group_pin))
     app.add_handler(CommandHandler("broadcastdmpin", broadcast_dm_pin))
+    app.add_handler(ChatMemberHandler(bot_membership_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("chatbot", chatbot))
     app.add_handler(CommandHandler("lang", lang_cmd))
     app.add_handler(CommandHandler("nsfwcheck", nsfwcheck))
@@ -2700,6 +2786,7 @@ async def run_bot(token, label):
 async def run_all_bots():
     load_clone_registry()
     load_bot_users_registry()
+    load_bot_groups_registry()
     tokens = [BOT_TOKEN]
 
     # Existing ENV clones are still supported for backward compatibility.
